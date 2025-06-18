@@ -1022,6 +1022,76 @@ mod tests {
     }
 
     #[test]
+    fn test_deposit_gas_charged_from_mint() {
+        // Test that deposit transactions are charged gas from their mint value
+        const MINT_VALUE: u128 = 1_000_000;
+        const BASE_FEE: u128 = 100;
+        const GAS_LIMIT: u64 = 1000;
+        const GAS_USED: u64 = 800;
+        
+        let caller = Address::from([0x42; 20]);
+        let mut db = InMemoryDB::default();
+        
+        // Start with zero balance
+        db.insert_account_info(
+            caller,
+            AccountInfo {
+                balance: U256::ZERO,
+                ..Default::default()
+            },
+        );
+        
+        let ctx = Context::op()
+            .with_db(db)
+            .modify_tx_chained(|tx| {
+                tx.base.tx_type = DEPOSIT_TRANSACTION_TYPE;
+                tx.base.caller = caller;
+                tx.base.gas_limit = GAS_LIMIT;
+                tx.base.gas_price = BASE_FEE; // Will be overridden by effective_gas_price
+                tx.deposit.source_hash = B256::ZERO;
+                tx.deposit.mint = Some(MINT_VALUE);
+            })
+            .modify_cfg_chained(|cfg| cfg.spec = OpSpecId::REGOLITH)
+            .modify_block_chained(|block| block.basefee = BASE_FEE as u64);
+            
+        let mut evm = ctx.build_op();
+        let handler = OpHandler::<_, EVMError<_, OpTransactionError>, EthFrame<_, _, _>>::new();
+        
+        // Step 1: Deduct caller (this adds mint and deducts gas)
+        handler.deduct_caller(&mut evm).unwrap();
+        
+        // Check balance after deduction: should be mint - (gas_limit * base_fee)
+        let balance_after_deduct = evm.ctx().journal().load_account(caller).unwrap().info.balance;
+        let expected_after_deduct = U256::from(MINT_VALUE) - U256::from(GAS_LIMIT as u128 * BASE_FEE);
+        assert_eq!(balance_after_deduct, expected_after_deduct);
+        
+        // Step 2: Simulate execution with some gas spent
+        let mut gas = Gas::new(GAS_LIMIT);
+        gas.set_spent(GAS_USED);
+        let mut exec_result = FrameResult::Call(CallOutcome::new(
+            InterpreterResult {
+                result: InstructionResult::Return,
+                output: Default::default(),
+                gas,
+            },
+            0..0,
+        ));
+        
+        // Step 3: Apply last frame result and reimburse
+        handler.last_frame_result(&mut evm, &mut exec_result).unwrap();
+        handler.reimburse_caller(&mut evm, &mut exec_result).unwrap();
+        
+        // Final balance should be: mint - (gas_used * base_fee)
+        let final_balance = evm.ctx().journal().load_account(caller).unwrap().info.balance;
+        let expected_final = U256::from(MINT_VALUE) - U256::from(GAS_USED as u128 * BASE_FEE);
+        assert_eq!(final_balance, expected_final);
+        
+        // Verify that gas was actually charged
+        let gas_charged = U256::from(MINT_VALUE) - final_balance;
+        assert_eq!(gas_charged, U256::from(GAS_USED as u128 * BASE_FEE));
+    }
+
+    #[test]
     fn test_system_address_no_refund() {
         // Test that transactions FROM the system address get no refunds
         let ctx = Context::op()
