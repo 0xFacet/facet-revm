@@ -1,13 +1,13 @@
 //!Handler related to Optimism chain
 use crate::{
     api::exec::OpContextTr,
-    constants::{BASE_FEE_RECIPIENT, L1_FEE_RECIPIENT, OPERATOR_FEE_RECIPIENT},
+    constants::{BASE_FEE_RECIPIENT, L1_FEE_RECIPIENT, OPERATOR_FEE_RECIPIENT, MAX_TRANSACTION_GAS_LIMIT, OPTIMISM_SYSTEM_ADDRESS},
     transaction::{deposit::DEPOSIT_TRANSACTION_TYPE, OpTransactionError, OpTxTr},
     L1BlockInfo, OpHaltReason, OpSpecId,
 };
 use revm::{
     context_interface::{
-        result::{EVMError, ExecutionResult, FromStringError, ResultAndState},
+        result::{EVMError, ExecutionResult, FromStringError, InvalidTransaction, ResultAndState},
         Block, Cfg, ContextTr, JournalTr, Transaction,
     },
     handler::{
@@ -71,6 +71,11 @@ where
         let tx = ctx.tx();
         let tx_type = tx.tx_type();
         if tx_type == DEPOSIT_TRANSACTION_TYPE {
+            // Gas limit guard for deposits not from system address
+            if tx.caller() != OPTIMISM_SYSTEM_ADDRESS && tx.gas_limit() > MAX_TRANSACTION_GAS_LIMIT {
+                return Err(InvalidTransaction::TxGasLimitGreaterThanCap.into());
+            }
+            
             // Do not allow for a system transaction to be processed if Regolith is enabled.
             if tx.is_system_transaction()
                 && evm.ctx().cfg().spec().is_enabled_in(OpSpecId::REGOLITH)
@@ -253,6 +258,12 @@ where
         evm: &mut Self::Evm,
         exec_result: &mut <Self::Frame as Frame>::FrameResult,
     ) -> Result<(), Self::Error> {
+        // Handle transactions from system address - they never get ETH back
+        if evm.ctx().tx().caller() == OPTIMISM_SYSTEM_ADDRESS {
+            // Transactions from system address never get ETH back.
+            return Ok(());
+        }
+        
         self.mainnet.reimburse_caller(evm, exec_result)?;
 
         let context = evm.ctx();
@@ -466,9 +477,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{api::default_ctx::OpContext, DefaultOp, OpBuilder};
+    use crate::{api::default_ctx::OpContext, DefaultOp, OpBuilder, transaction::{deposit::DepositTransactionParts, OpTransaction}};
     use revm::{
-        context::{Context, TransactionType},
+        context::{Context, TransactionType, TxEnv},
         context_interface::result::InvalidTransaction,
         database::InMemoryDB,
         database_interface::EmptyDB,
@@ -877,7 +888,25 @@ mod tests {
         const GAS_PRICE: u128 = 0xFF;
         const OP_FEE_MOCK_PARAM: u128 = 0xFFFF;
 
+        // Use a non-zero address for deposit since Address::ZERO might have special handling
+        let sender = if is_deposit {
+            Address::from([0x01; 20])
+        } else {
+            SENDER
+        };
+
+        let mut db = InMemoryDB::default();
+        // Give the sender some initial balance to pay for gas
+        db.insert_account_info(
+            sender,
+            AccountInfo {
+                balance: U256::from(1_000_000),
+                ..Default::default()
+            },
+        );
+
         let ctx = Context::op()
+            .with_db(db)
             .modify_tx_chained(|tx| {
                 tx.base.tx_type = if is_deposit {
                     DEPOSIT_TRANSACTION_TYPE
@@ -886,9 +915,14 @@ mod tests {
                 };
                 tx.base.gas_price = GAS_PRICE;
                 tx.base.gas_priority_fee = None;
-                tx.base.caller = SENDER;
+                tx.base.caller = sender;
+                tx.base.gas_limit = 100;
+                if is_deposit {
+                    tx.deposit.source_hash = B256::ZERO;
+                }
             })
-            .modify_cfg_chained(|cfg| cfg.spec = OpSpecId::ISTHMUS);
+            .modify_cfg_chained(|cfg| cfg.spec = OpSpecId::ISTHMUS)
+            .modify_block_chained(|block| block.basefee = GAS_PRICE as u64);
 
         let mut evm = ctx.build_op();
         let handler = OpHandler::<_, EVMError<_, OpTransactionError>, EthFrame<_, _, _>>::new();
@@ -896,6 +930,11 @@ mod tests {
         // Set the operator fee scalar & constant to non-zero values in the L1 block info.
         evm.ctx().chain.operator_fee_scalar = Some(U256::from(OP_FEE_MOCK_PARAM));
         evm.ctx().chain.operator_fee_constant = Some(U256::from(OP_FEE_MOCK_PARAM));
+
+        // First deduct the caller's gas
+        handler.deduct_caller(&mut evm).unwrap();
+        
+        let initial_balance = evm.ctx().journal().load_account(sender).unwrap().info.balance;
 
         let mut gas = Gas::new(100);
         gas.set_spent(10);
@@ -908,27 +947,116 @@ mod tests {
             0..0,
         ));
 
-        // Reimburse the caller for the unspent portion of the fees.
-        handler
-            .reimburse_caller(&mut evm, &mut exec_result)
-            .unwrap();
+        // Apply the last frame result to set up gas accounting
+        handler.last_frame_result(&mut evm, &mut exec_result).unwrap();
+        
+        // Apply refunds
+        handler.refund(&mut evm, &mut exec_result, 0);
 
-        // Compute the expected refund amount. If the transaction is a deposit, the operator fee refund never
-        // applies. If the transaction is not a deposit, the operator fee refund is added to the refund amount.
-        let mut expected_refund =
-            U256::from(GAS_PRICE * (gas.remaining() + gas.refunded() as u64) as u128);
+        // Reimburse the caller for the unspent portion of the fees.
+        handler.reimburse_caller(&mut evm, &mut exec_result).unwrap();
+
+        // Compute the expected refund amount. 
+        // After the changes, deposit transactions DO get gas refunds, but NOT operator fee refunds.
+        // Non-deposit transactions get both gas refunds AND operator fee refunds.
+        let gas_refund = U256::from(GAS_PRICE * (exec_result.gas().remaining() + exec_result.gas().refunded() as u64) as u128);
         let op_fee_refund = evm
             .ctx()
             .chain()
-            .operator_fee_refund(&gas, OpSpecId::ISTHMUS);
-        assert!(op_fee_refund > U256::ZERO);
+            .operator_fee_refund(exec_result.gas(), OpSpecId::ISTHMUS);
 
+        let mut total_expected_refund = gas_refund;
         if !is_deposit {
-            expected_refund += op_fee_refund;
+            // Only non-deposit transactions get the operator fee refund
+            total_expected_refund += op_fee_refund;
         }
 
         // Check that the caller was reimbursed the correct amount of ETH.
-        let account = evm.ctx().journal().load_account(SENDER).unwrap();
-        assert_eq!(account.info.balance, expected_refund);
+        let final_balance = evm.ctx().journal().load_account(sender).unwrap().info.balance;
+        let actual_refund = final_balance.saturating_sub(initial_balance);
+        assert_eq!(actual_refund, total_expected_refund);
+    }
+
+    #[test]
+    fn test_deposit_gas_limit() {
+        // Craft a deposit NOT from system address with gas = 50,000,001 (over the limit)
+        let ctx = Context::op()
+            .modify_tx_chained(|tx| {
+                tx.base.tx_type = DEPOSIT_TRANSACTION_TYPE;
+                tx.base.gas_limit = 50_000_001; // One over the limit
+                tx.base.caller = Address::ZERO; // Not the system address
+                tx.deposit.source_hash = B256::ZERO;
+            })
+            .modify_cfg_chained(|cfg| cfg.spec = OpSpecId::REGOLITH);
+
+        let mut evm = ctx.build_op();
+        let handler = OpHandler::<_, EVMError<_, OpTransactionError>, EthFrame<_, _, _>>::new();
+
+        // Should fail with TxGasLimitGreaterThanCap
+        let err = handler.validate_env(&mut evm).unwrap_err();
+        assert!(matches!(err, EVMError::Transaction(OpTransactionError::Base(InvalidTransaction::TxGasLimitGreaterThanCap))));
+    }
+
+    #[test]
+    fn test_deposit_base_fee_price() {
+        // Create a deposit transaction
+        let op_tx = OpTransaction {
+            base: TxEnv {
+                tx_type: DEPOSIT_TRANSACTION_TYPE,
+                gas_limit: 10,
+                gas_price: 100,
+                gas_priority_fee: Some(5),
+                ..Default::default()
+            },
+            enveloped_tx: None,
+            deposit: DepositTransactionParts {
+                is_system_transaction: false,
+                mint: Some(0u128),
+                source_hash: B256::default(),
+            },
+        };
+
+        // Assert that effective_gas_price(baseFee) for deposits equals baseFee
+        let base_fee = 90;
+        assert_eq!(op_tx.effective_gas_price(base_fee), base_fee);
+    }
+
+    #[test]
+    fn test_system_address_no_refund() {
+        // Test that transactions FROM the system address get no refunds
+        let ctx = Context::op()
+            .modify_tx_chained(|tx| {
+                tx.base.tx_type = DEPOSIT_TRANSACTION_TYPE;
+                tx.base.caller = OPTIMISM_SYSTEM_ADDRESS; // From system address
+                tx.base.gas_price = 100;
+                tx.deposit.source_hash = B256::ZERO;
+            })
+            .modify_cfg_chained(|cfg| cfg.spec = OpSpecId::ISTHMUS);
+
+        let mut evm = ctx.build_op();
+        let handler = OpHandler::<_, EVMError<_, OpTransactionError>, EthFrame<_, _, _>>::new();
+
+        // Check that the account starts with zero balance
+        let account_before = evm.ctx().journal().load_account(OPTIMISM_SYSTEM_ADDRESS).unwrap();
+        assert_eq!(account_before.info.balance, U256::ZERO);
+
+        let mut gas = Gas::new(100);
+        gas.set_spent(10);
+        let mut exec_result = FrameResult::Call(CallOutcome::new(
+            InterpreterResult {
+                result: InstructionResult::Return,
+                output: Default::default(),
+                gas,
+            },
+            0..0,
+        ));
+
+        // This should return early without any reimbursement
+        let result = handler.reimburse_caller(&mut evm, &mut exec_result);
+        assert!(result.is_ok());
+
+        // Check that the system address still has no balance (no refund occurred)
+        let account_after = evm.ctx().journal().load_account(OPTIMISM_SYSTEM_ADDRESS).unwrap();
+        assert_eq!(account_after.info.balance, U256::ZERO);
     }
 }

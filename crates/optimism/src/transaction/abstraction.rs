@@ -127,7 +127,11 @@ impl<T: Transaction> Transaction for OpTransaction<T> {
     }
 
     fn effective_gas_price(&self, base_fee: u128) -> u128 {
-        self.base.effective_gas_price(base_fee)
+        if self.tx_type() == DEPOSIT_TRANSACTION_TYPE {
+            base_fee
+        } else {
+            self.base.effective_gas_price(base_fee)
+        }
     }
 
     fn authorization_list_len(&self) -> usize {
@@ -190,7 +194,7 @@ mod tests {
         assert_eq!(op_tx.gas_limit(), 10);
         assert_eq!(op_tx.kind(), revm::primitives::TxKind::Call(Address::ZERO));
         // Verify gas related calculations
-        assert_eq!(op_tx.effective_gas_price(90), 95);
+        assert_eq!(op_tx.effective_gas_price(90), 90);
         assert_eq!(op_tx.max_fee_per_gas(), 100);
     }
 }

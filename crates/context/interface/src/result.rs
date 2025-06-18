@@ -360,6 +360,8 @@ pub enum InvalidTransaction {
     AuthorizationListNotSupported,
     /// EIP-7702 transaction has invalid fields set.
     AuthorizationListInvalidFields,
+    /// Deposit transaction gas limit exceeds the maximum allowed cap.
+    TxGasLimitGreaterThanCap,
     /// Empty Authorization List is not allowed.
     EmptyAuthorizationList,
     /// EIP-2930 is not supported.
@@ -448,6 +450,9 @@ impl fmt::Display for InvalidTransaction {
             Self::AuthorizationListNotSupported => write!(f, "authorization list not supported"),
             Self::AuthorizationListInvalidFields => {
                 write!(f, "authorization list tx has invalid fields")
+            }
+            Self::TxGasLimitGreaterThanCap => {
+                write!(f, "transaction gas limit exceeds the maximum cap for deposits")
             }
             Self::EmptyAuthorizationList => write!(f, "empty authorization list"),
             Self::Eip2930NotSupported => write!(f, "Eip2930 is not supported"),
