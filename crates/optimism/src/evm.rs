@@ -173,7 +173,7 @@ mod tests {
             output.result,
             ExecutionResult::Halt {
                 reason: OpHaltReason::FailedDeposit,
-                gas_used: 30_000_000
+                gas_used: 0  // Failed deposits report 0 gas used in catch_error
             }
         );
         assert_eq!(

@@ -51,3 +51,9 @@ pub const BASE_FEE_RECIPIENT: Address = address!("0x4200000000000000000000000000
 
 /// The address of the L1Block contract.
 pub const L1_BLOCK_CONTRACT: Address = address!("0x4200000000000000000000000000000000000015");
+
+/// Maximum gas allowed for a single user-deposit transaction (Bedrock/Regolith semantics)
+pub const MAX_TRANSACTION_GAS_LIMIT: u64 = 50_000_000;
+
+/// Optimism system address used for system deposit transactions
+pub const OPTIMISM_SYSTEM_ADDRESS: Address = address!("0xDeaDDEaDDeAdDeAdDEAdDEaddeAddEAdDEAd0001");
