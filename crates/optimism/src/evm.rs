@@ -173,12 +173,17 @@ mod tests {
             output.result,
             ExecutionResult::Halt {
                 reason: OpHaltReason::FailedDeposit,
-                gas_used: 0  // Failed deposits report 0 gas used in catch_error
+                gas_used: 30_000_000  // Halted deposits now report actual gas used
             }
         );
+        // Balance should be mint + previous balance from DB - gas cost
+        // catch_error loads account from DB, so it includes BENCH_CALLER_BALANCE
+        // If gas price is 0 (common in tests), no gas cost is deducted
+        let balance = output.state.get(&BENCH_CALLER).map(|a| a.info.balance).unwrap();
         assert_eq!(
-            output.state.get(&BENCH_CALLER).map(|a| a.info.balance),
-            Some(U256::from(100) + BENCH_CALLER_BALANCE)
+            balance,
+            U256::from(100) + BENCH_CALLER_BALANCE,
+            "Balance should be mint + previous balance (gas price is likely 0 in test)"
         );
     }
 

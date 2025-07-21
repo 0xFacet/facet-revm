@@ -38,7 +38,7 @@ pub enum OpTransactionError {
     /// special gas accounting rules are applied. Normally on L1, [EVMError::Transaction] errors
     /// are cause for non-inclusion, so a special [OpHaltReason][crate::OpHaltReason] variant was introduced to handle this
     /// case for failed deposit transactions.
-    HaltedDepositPostRegolith,
+    HaltedDepositPostRegolith(u64),
 }
 
 impl TransactionError for OpTransactionError {}
@@ -53,10 +53,11 @@ impl Display for OpTransactionError {
                     "deposit system transactions post regolith hardfork are not supported"
                 )
             }
-            Self::HaltedDepositPostRegolith => {
+            Self::HaltedDepositPostRegolith(gas) => {
                 write!(
                     f,
-                    "deposit transaction halted post-regolith; error will be bubbled up to main return handler"
+                    "deposit transaction halted post-regolith (gas_used = {})",
+                    gas
                 )
             }
         }

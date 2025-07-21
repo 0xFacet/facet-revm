@@ -52,10 +52,25 @@ impl<DB, TX> IsTxError for EVMError<DB, TX> {
     }
 }
 
+// Extension trait for extracting gas from halted deposits
+pub trait ExtractHaltedDepositGas {
+    fn extract_halted_deposit_gas(&self) -> Option<u64>;
+}
+
+// Implementation for OpTransactionError specifically
+impl<DB> ExtractHaltedDepositGas for EVMError<DB, OpTransactionError> {
+    fn extract_halted_deposit_gas(&self) -> Option<u64> {
+        match self {
+            EVMError::Transaction(OpTransactionError::HaltedDepositPostRegolith(gas)) => Some(*gas),
+            _ => None,
+        }
+    }
+}
+
 impl<EVM, ERROR, FRAME> Handler for OpHandler<EVM, ERROR, FRAME>
 where
     EVM: EvmTr<Context: OpContextTr>,
-    ERROR: EvmTrError<EVM> + From<OpTransactionError> + FromStringError + IsTxError,
+    ERROR: EvmTrError<EVM> + From<OpTransactionError> + FromStringError + IsTxError + ExtractHaltedDepositGas,
     // TODO `FrameResult` should be a generic trait.
     // TODO `FrameInit` should be a generic.
     FRAME: Frame<Evm = EVM, Error = ERROR, FrameResult = FrameResult, FrameInit = FrameInput>,
@@ -383,7 +398,11 @@ where
             // and the caller nonce will be incremented there.
             let is_deposit = evm.ctx().tx().tx_type() == DEPOSIT_TRANSACTION_TYPE;
             if is_deposit && evm.ctx().cfg().spec().is_enabled_in(OpSpecId::REGOLITH) {
-                return Err(ERROR::from(OpTransactionError::HaltedDepositPostRegolith));
+                let gas_used = match &result.result {
+                    ExecutionResult::Halt { gas_used, .. } => *gas_used,
+                    _ => unreachable!("checked is_halt above"),
+                };
+                return Err(ERROR::from(OpTransactionError::HaltedDepositPostRegolith(gas_used)));
             }
         }
         evm.ctx().chain().clear_tx_l1_cost();
@@ -408,6 +427,14 @@ where
             // easily distinguish between a failed deposit and a failed
             // normal transaction.
 
+            // Extract gas_used from error if it's a halted deposit, otherwise 0
+            let gas_used = error.extract_halted_deposit_gas().unwrap_or(0);
+            
+            // Calculate gas cost using basefee for deposits
+            let base_fee = evm.ctx().block().basefee() as u128;
+            let gas_cost = U256::from(gas_used as u128)
+                .saturating_mul(U256::from(base_fee));
+            
             // Increment sender nonce and account balance for the mint amount. Deposits
             // always persist the mint amount, even if the transaction fails.
             let account = {
@@ -422,18 +449,12 @@ where
                 acc.info.balance = acc
                     .info
                     .balance
-                    .saturating_add(U256::from(mint.unwrap_or_default()));
+                    .saturating_add(U256::from(mint.unwrap_or_default()))
+                    .saturating_sub(gas_cost); // Deduct gas cost from balance
                 acc.mark_touch();
                 acc
             };
             let state = HashMap::from_iter([(caller, account)]);
-            
-            // For validation/pre-check failures, no gas has been consumed yet.
-            // The Regolith rules about using gas_limit only apply to deposits that
-            // fail during execution, not during validation.
-            // Since catch_error is called before deduct_caller for validation errors,
-            // we should report 0 gas used for these cases.
-            let gas_used = 0;
             // clear the journal
             Ok(ResultAndState {
                 result: ExecutionResult::Halt {
@@ -459,7 +480,7 @@ where
         Context: OpContextTr,
         Inspector: Inspector<<<Self as Handler>::Evm as EvmTr>::Context, EthInterpreter>,
     >,
-    ERROR: EvmTrError<EVM> + From<OpTransactionError> + FromStringError + IsTxError,
+    ERROR: EvmTrError<EVM> + From<OpTransactionError> + FromStringError + IsTxError + ExtractHaltedDepositGas,
     // TODO `FrameResult` should be a generic trait.
     // TODO `FrameInit` should be a generic.
     FRAME: InspectorFrame<
@@ -865,22 +886,23 @@ mod tests {
         let mut evm = ctx.build_op();
         let handler = OpHandler::<_, EVMError<_, OpTransactionError>, EthFrame<_, _, _>>::new();
 
-        assert_eq!(
-            handler.output(
-                &mut evm,
-                FrameResult::Call(CallOutcome {
-                    result: InterpreterResult {
-                        result: InstructionResult::OutOfGas,
-                        output: Default::default(),
-                        gas: Default::default(),
-                    },
-                    memory_offset: Default::default(),
-                })
-            ),
+        let result = handler.output(
+            &mut evm,
+            FrameResult::Call(CallOutcome {
+                result: InterpreterResult {
+                    result: InstructionResult::OutOfGas,
+                    output: Default::default(),
+                    gas: Default::default(),
+                },
+                memory_offset: Default::default(),
+            })
+        );
+        assert!(matches!(
+            result,
             Err(EVMError::Transaction(
-                OpTransactionError::HaltedDepositPostRegolith
+                OpTransactionError::HaltedDepositPostRegolith(_)
             ))
-        )
+        ))
     }
 
     #[rstest]
@@ -1328,13 +1350,14 @@ mod tests {
                     ExecutionResult::Halt { reason: OpHaltReason::FailedDeposit, gas_used } => {
                         println!("Deposit halted with gas_used: {}", gas_used);
                         
-                        // This is the issue: halts go through catch_error and lose gas info
-                        assert_eq!(gas_used, 0, "Halted deposits currently report 0 gas due to catch_error");
+                        // Now correctly reports gas used
+                        assert_eq!(gas_used, GAS_LIMIT, "Halted deposits consume all gas");
                         
                         // Verify the account state
                         if let Some(account) = state.get(&caller) {
                             assert_eq!(account.info.nonce, 1, "Nonce should be incremented");
-                            assert_eq!(account.info.balance, U256::from(MINT_VALUE), "Mint value should be applied (no gas deducted)");
+                            let expected_balance = U256::from(MINT_VALUE) - U256::from(gas_used as u128 * BASE_FEE);
+                            assert_eq!(account.info.balance, expected_balance, "Balance should be mint minus gas cost");
                         } else {
                             panic!("Caller account not found in state");
                         }
@@ -1385,5 +1408,112 @@ mod tests {
         // Check that the system address still has no balance (no refund occurred)
         let account_after = evm.ctx().journal().load_account(OPTIMISM_SYSTEM_ADDRESS).unwrap();
         assert_eq!(account_after.info.balance, U256::ZERO);
+    }
+
+    #[test]
+    fn test_halted_deposit_gas_should_count() {
+        // This test demonstrates that halted deposits should consume gas from block limit
+        // Currently FAILS: Reports 0 gas, but SHOULD report actual gas consumed
+        const MINT_VALUE: u128 = 10_000_000;
+        const BASE_FEE: u128 = 100;
+        const GAS_LIMIT: u64 = 100_000;
+        
+        let caller = Address::from([0x48; 20]);
+        let contract = Address::from([0x49; 20]);
+        let mut db = InMemoryDB::default();
+        
+        db.insert_account_info(
+            caller,
+            AccountInfo {
+                balance: U256::ZERO,
+                ..Default::default()
+            },
+        );
+        
+        // Deploy a contract that consumes A LOT of gas before halting
+        // This simulates an attack where someone tries to fill blocks with "free" computation
+        let mut bytecode_vec = Vec::new();
+        
+        // First, allocate a large amount of memory (expensive operation)
+        bytecode_vec.extend_from_slice(&[
+            0x61, 0x10, 0x00, // PUSH2 0x1000 (4096 bytes)
+            0x60, 0x00,       // PUSH1 0x00
+            0x53,             // MSTORE8 (allocates 4096 bytes of memory)
+        ]);
+        
+        // Then do some expensive operations in a loop
+        for _ in 0..10 {
+            bytecode_vec.extend_from_slice(&[
+                0x60, 0x20,       // PUSH1 0x20
+                0x60, 0x00,       // PUSH1 0x00
+                0x20,             // SHA3 (expensive operation)
+                0x50,             // POP
+            ]);
+        }
+        
+        // Finally halt with INVALID
+        bytecode_vec.push(0xFE); // INVALID opcode
+        
+        let bytecode = Bytecode::new_legacy(Bytes::from(bytecode_vec));
+        
+        db.insert_account_info(
+            contract,
+            AccountInfo {
+                code: Some(bytecode),
+                ..Default::default()
+            },
+        );
+        
+        let ctx = Context::op()
+            .with_db(db)
+            .modify_tx_chained(|tx| {
+                tx.base.tx_type = DEPOSIT_TRANSACTION_TYPE;
+                tx.base.caller = caller;
+                tx.base.gas_limit = GAS_LIMIT;
+                tx.base.gas_price = BASE_FEE;
+                tx.base.kind = TxKind::Call(contract);
+                tx.deposit.source_hash = B256::ZERO;
+                tx.deposit.mint = Some(MINT_VALUE);
+            })
+            .modify_cfg_chained(|cfg| cfg.spec = OpSpecId::REGOLITH)
+            .modify_block_chained(|block| block.basefee = BASE_FEE as u64);
+            
+        let mut evm = ctx.build_op();
+        let mut handler = OpHandler::<_, EVMError<_, OpTransactionError>, EthFrame<_, _, _>>::new();
+        
+        // Execute the transaction
+        let result = handler.run(&mut evm);
+        
+        match result {
+            Ok(ResultAndState { result, state }) => {
+                match result {
+                    ExecutionResult::Halt { reason: OpHaltReason::FailedDeposit, gas_used } => {
+                        println!("Halted deposit reported gas_used: {}", gas_used);
+                        
+                        // THIS IS THE BUG: Currently reports 0, but should report actual gas consumed
+                        // The transaction executed expensive operations before halting!
+                        assert!(
+                            gas_used > 0, 
+                            "Halted deposits that consume gas before halting should report actual gas used, not 0. \
+                             This allows attackers to fill blocks with computation that doesn't count against gas limit!"
+                        );
+                        
+                        // Verify state is correct (nonce incremented, mint applied)
+                        if let Some(account) = state.get(&caller) {
+                            assert_eq!(account.info.nonce, 1, "Nonce should be incremented");
+                            // Gas should have been deducted from mint
+                            let expected_balance = U256::from(MINT_VALUE) - U256::from(gas_used as u128 * BASE_FEE);
+                            assert_eq!(
+                                account.info.balance, 
+                                expected_balance, 
+                                "Balance should be mint minus gas actually consumed"
+                            );
+                        }
+                    }
+                    _ => panic!("Expected FailedDeposit but got: {:?}", result),
+                }
+            }
+            Err(err) => panic!("Expected success with FailedDeposit but got error: {:?}", err),
+        }
     }
 }
