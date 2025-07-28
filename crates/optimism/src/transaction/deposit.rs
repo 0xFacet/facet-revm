@@ -1,6 +1,6 @@
 use revm::primitives::B256;
 
-pub const DEPOSIT_TRANSACTION_TYPE: u8 = 0x7E;
+pub const DEPOSIT_TRANSACTION_TYPE: u8 = 0x7D;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

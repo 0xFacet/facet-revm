@@ -236,8 +236,8 @@ pub fn validate_tx_against_account<CTX: ContextTr>(
 ) -> Result<(), InvalidTransaction> {
     let tx = context.tx();
     let tx_type = context.tx().tx_type();
-    const DEPOSIT_TX_TYPE: u8 = 0x7E;
-    let is_deposit = tx_type == DEPOSIT_TX_TYPE;
+    const DEPOSIT_TRANSACTION_TYPE: u8 = 0x7D;
+    let is_deposit = tx_type == DEPOSIT_TRANSACTION_TYPE;
     // EIP-3607: Reject transactions from senders with deployed code
     // This EIP is introduced after london but there was no collision in past
     // so we can leave it enabled always
@@ -266,7 +266,7 @@ pub fn validate_tx_against_account<CTX: ContextTr>(
     }
 
     // gas_limit * max_fee + value + additional_gas_cost
-    // For deposit transactions (type 0x7E), use effective_gas_price instead of max_fee_per_gas
+    // For deposit transactions (type 0x7D), use effective_gas_price instead of max_fee_per_gas
     // This matches Geth's behavior where deposits use gas_price instead of gas_fee_cap
     let gas_price = if is_deposit {
         tx.effective_gas_price(context.block().basefee() as u128)
